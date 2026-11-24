@@ -1,0 +1,386 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Relay | Multi-Tenant Webhook & Event Engine</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      darkMode: 'class',
+      theme: {
+        extend: {
+          colors: {
+            brand: { 500: '#6366f1', 600: '#4f46e5', 700: '#4338ca' }
+          }
+        }
+      }
+    }
+  </script>
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap');
+    body { font-family: 'Plus Jakarta Sans', sans-serif; }
+    pre, code { font-family: 'JetBrains Mono', monospace; }
+  </style>
+</head>
+<body class="bg-slate-950 text-slate-100 min-h-screen flex flex-col">
+
+  <!-- Header -->
+  <header class="border-b border-slate-800 bg-slate-900/60 backdrop-blur sticky top-0 z-40">
+    <div class="max-w-7xl mx-auto px-6 h-16 flex items-center justify-between">
+      <div class="flex items-center space-x-3">
+        <div class="w-9 h-9 rounded-xl bg-indigo-600 flex items-center justify-center font-bold text-white shadow-lg shadow-indigo-500/20">
+          ⚡
+        </div>
+        <div>
+          <h1 class="text-lg font-bold tracking-tight text-white flex items-center gap-2">
+            Relay Engine
+            <span class="text-xs px-2 py-0.5 rounded-full bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 font-mono">v2.0 LIVE</span>
+          </h1>
+          <p class="text-xs text-slate-400">Multi-Tenant Webhook Dispatcher & Replay Platform</p>
+        </div>
+      </div>
+      <div class="flex items-center space-x-4">
+        <button onclick="fetchStats(); fetchDeliveries();" class="text-xs px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 font-medium transition flex items-center gap-1.5">
+          <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/></svg>
+          Refresh
+        </button>
+        <a href="/metrics" target="_blank" class="text-xs px-3 py-1.5 rounded-lg bg-indigo-600/10 hover:bg-indigo-600/20 text-indigo-400 border border-indigo-500/30 font-mono">
+          /metrics
+        </a>
+      </div>
+    </div>
+  </header>
+
+  <!-- Main Container -->
+  <main class="max-w-7xl mx-auto px-6 py-8 flex-1 w-full space-y-8">
+
+    <!-- Metrics Grid -->
+    <div class="grid grid-cols-1 md:grid-cols-5 gap-4">
+      <div class="p-4 rounded-xl bg-slate-900 border border-slate-800 shadow-sm">
+        <p class="text-xs font-medium text-slate-400 uppercase tracking-wider">Total Events</p>
+        <p id="stat-events" class="text-2xl font-bold text-white mt-1">0</p>
+      </div>
+      <div class="p-4 rounded-xl bg-slate-900 border border-slate-800 shadow-sm">
+        <p class="text-xs font-medium text-slate-400 uppercase tracking-wider">Total Deliveries</p>
+        <p id="stat-deliveries" class="text-2xl font-bold text-white mt-1">0</p>
+      </div>
+      <div class="p-4 rounded-xl bg-slate-900 border border-slate-800 shadow-sm">
+        <p class="text-xs font-medium text-slate-400 uppercase tracking-wider">Success Rate</p>
+        <p id="stat-success-rate" class="text-2xl font-bold text-emerald-400 mt-1">0.0%</p>
+      </div>
+      <div class="p-4 rounded-xl bg-slate-900 border border-slate-800 shadow-sm">
+        <p class="text-xs font-medium text-slate-400 uppercase tracking-wider">Avg Latency</p>
+        <p id="stat-latency" class="text-2xl font-bold text-indigo-400 mt-1">0ms</p>
+      </div>
+      <div class="p-4 rounded-xl bg-slate-900 border border-slate-800 shadow-sm">
+        <p class="text-xs font-medium text-slate-400 uppercase tracking-wider">Dead Letters (DLQ)</p>
+        <p id="stat-dlq" class="text-2xl font-bold text-rose-400 mt-1">0</p>
+      </div>
+    </div>
+
+    <!-- Quick Action Bar -->
+    <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
+      <!-- Ingest Event Panel -->
+      <div class="lg:col-span-2 p-5 rounded-xl bg-slate-900 border border-slate-800 space-y-4">
+        <div class="flex items-center justify-between">
+          <h2 class="text-sm font-semibold text-white flex items-center gap-2">
+            <span>🚀 Publish Event & Fanout</span>
+          </h2>
+          <span class="text-xs text-slate-500 font-mono">POST /v1/tenants/:tenant/events</span>
+        </div>
+        <div class="grid grid-cols-2 gap-3">
+          <div>
+            <label class="text-xs text-slate-400 font-medium">Tenant ID</label>
+            <input id="input-tenant" type="text" value="ten_demo" class="mt-1 w-full px-3 py-1.5 rounded-lg bg-slate-950 border border-slate-700 text-sm font-mono text-slate-200">
+          </div>
+          <div>
+            <label class="text-xs text-slate-400 font-medium">Event Type</label>
+            <input id="input-event-type" type="text" value="payment.succeeded" class="mt-1 w-full px-3 py-1.5 rounded-lg bg-slate-950 border border-slate-700 text-sm font-mono text-slate-200">
+          </div>
+        </div>
+        <div>
+          <label class="text-xs text-slate-400 font-medium">JSON Payload</label>
+          <textarea id="input-payload" rows="3" class="mt-1 w-full p-2.5 rounded-lg bg-slate-950 border border-slate-700 text-xs font-mono text-emerald-400">{ "charge_id": "ch_8291038", "amount": 9900, "currency": "usd", "customer": "cus_john_doe" }</textarea>
+        </div>
+        <div class="flex justify-end gap-3">
+          <button onclick="injectSampleEvent()" class="px-4 py-2 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-semibold shadow-md shadow-indigo-600/20 transition">
+            Publish Event
+          </button>
+        </div>
+      </div>
+
+      <!-- Quick Setup / Endpoints summary -->
+      <div class="p-5 rounded-xl bg-slate-900 border border-slate-800 space-y-4 flex flex-col justify-between">
+        <div class="space-y-3">
+          <h2 class="text-sm font-semibold text-white">⚡ Features & Security</h2>
+          <ul class="text-xs text-slate-400 space-y-2">
+            <li class="flex items-center gap-2">
+              <span class="text-emerald-400">✓</span> HMAC-SHA256 signature header (<code class="text-indigo-300">X-Webhook-Signature</code>)
+            </li>
+            <li class="flex items-center gap-2">
+              <span class="text-emerald-400">✓</span> Exponential backoff with Full Jitter
+            </li>
+            <li class="flex items-center gap-2">
+              <span class="text-emerald-400">✓</span> Dead-Letter Queue (DLQ) with instant replay
+            </li>
+            <li class="flex items-center gap-2">
+              <span class="text-emerald-400">✓</span> At-least-once partitioned concurrency
+            </li>
+          </ul>
+        </div>
+        <div class="pt-3 border-t border-slate-800">
+          <button onclick="registerSampleEndpoint()" class="w-full py-2 rounded-lg bg-slate-800 hover:bg-slate-700 text-xs font-medium text-slate-200 transition">
+            + Register Demo Endpoint (httpbin.org)
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Live Deliveries Table -->
+    <div class="p-5 rounded-xl bg-slate-900 border border-slate-800 space-y-4">
+      <div class="flex items-center justify-between">
+        <div>
+          <h2 class="text-sm font-semibold text-white">📡 Real-Time Webhook Deliveries</h2>
+          <p class="text-xs text-slate-400">Audit logs with latency, HTTP status codes, and 1-click replayers</p>
+        </div>
+        <div class="flex items-center gap-2">
+          <select id="filter-status" onchange="fetchDeliveries()" class="px-2.5 py-1.5 rounded-lg bg-slate-950 border border-slate-700 text-xs text-slate-300">
+            <option value="">All Statuses</option>
+            <option value="success">Success</option>
+            <option value="retrying">Retrying</option>
+            <option value="dead_letter">Dead Letter (DLQ)</option>
+            <option value="pending">Pending</option>
+          </select>
+        </div>
+      </div>
+
+      <div class="overflow-x-auto rounded-lg border border-slate-800">
+        <table class="w-full text-left text-xs">
+          <thead class="bg-slate-950/60 text-slate-400 uppercase font-mono text-[11px] border-b border-slate-800">
+            <tr>
+              <th class="px-4 py-3">Delivery ID</th>
+              <th class="px-4 py-3">Event Type</th>
+              <th class="px-4 py-3">Destination URL</th>
+              <th class="px-4 py-3">Status</th>
+              <th class="px-4 py-3">Attempts</th>
+              <th class="px-4 py-3">Created</th>
+              <th class="px-4 py-3 text-right">Actions</th>
+            </tr>
+          </thead>
+          <tbody id="deliveries-table" class="divide-y divide-slate-800/60 text-slate-300 font-mono">
+            <tr>
+              <td colspan="7" class="px-4 py-8 text-center text-slate-500 font-sans">Loading delivery records...</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+  </main>
+
+  <!-- Modal for Attempt Trace Inspection -->
+  <div id="trace-modal" class="fixed inset-0 bg-black/70 backdrop-blur-sm z-50 hidden flex items-center justify-center p-4">
+    <div class="bg-slate-900 border border-slate-800 rounded-2xl max-w-2xl w-full p-6 space-y-4 shadow-2xl">
+      <div class="flex items-center justify-between border-b border-slate-800 pb-3">
+        <h3 class="text-sm font-bold text-white font-mono" id="modal-title">Delivery Details</h3>
+        <button onclick="closeModal()" class="text-slate-400 hover:text-white">&times;</button>
+      </div>
+      <div class="space-y-3 text-xs max-h-[70vh] overflow-y-auto">
+        <div>
+          <span class="text-slate-400 uppercase font-semibold text-[10px]">Endpoint:</span>
+          <p id="modal-url" class="font-mono text-indigo-400 break-all"></p>
+        </div>
+        <div>
+          <span class="text-slate-400 uppercase font-semibold text-[10px]">Event Payload:</span>
+          <pre id="modal-payload" class="p-3 rounded-lg bg-slate-950 border border-slate-800 text-emerald-400 overflow-x-auto"></pre>
+        </div>
+        <div>
+          <span class="text-slate-400 uppercase font-semibold text-[10px]">Execution Attempts:</span>
+          <div id="modal-attempts" class="space-y-2 mt-1"></div>
+        </div>
+      </div>
+      <div class="flex justify-end pt-2 border-t border-slate-800">
+        <button onclick="closeModal()" class="px-4 py-2 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-semibold">
+          Close
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <footer class="border-t border-slate-900 py-4 text-center text-xs text-slate-600">
+    Relay Webhook Platform • Production Grade Microservice
+  </footer>
+
+  <script>
+    async function fetchStats() {
+      try {
+        const res = await fetch('/v1/stats');
+        const data = await res.json();
+        document.getElementById('stat-events').innerText = (data.total_events || 0).toLocaleString();
+        document.getElementById('stat-deliveries').innerText = (data.total_deliveries || 0).toLocaleString();
+        document.getElementById('stat-success-rate').innerText = (data.success_rate_pct || 0).toFixed(1) + '%';
+        document.getElementById('stat-latency').innerText = Math.round(data.avg_latency_ms || 0) + 'ms';
+        document.getElementById('stat-dlq').innerText = (data.dead_letter_count || 0).toLocaleString();
+      } catch (err) {
+        console.error('Failed to fetch stats:', err);
+      }
+    }
+
+    async function fetchDeliveries() {
+      const status = document.getElementById('filter-status').value;
+      const url = status ? `/v1/deliveries?status=${status}&limit=25` : '/v1/deliveries?limit=25';
+      try {
+        const res = await fetch(url);
+        const deliveries = await res.json();
+        const tbody = document.getElementById('deliveries-table');
+        if (!deliveries || deliveries.length === 0) {
+          tbody.innerHTML = `<tr><td colspan="7" class="px-4 py-8 text-center text-slate-500 font-sans">No deliveries recorded yet. Publish an event to get started.</td></tr>`;
+          return;
+        }
+
+        tbody.innerHTML = deliveries.map(d => {
+          let badge = '';
+          if (d.status === 'success') {
+            badge = '<span class="px-2 py-0.5 rounded text-[10px] bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">SUCCESS</span>';
+          } else if (d.status === 'retrying') {
+            badge = '<span class="px-2 py-0.5 rounded text-[10px] bg-amber-500/10 text-amber-400 border border-amber-500/20">RETRYING</span>';
+          } else if (d.status === 'dead_letter') {
+            badge = '<span class="px-2 py-0.5 rounded text-[10px] bg-rose-500/10 text-rose-400 border border-rose-500/20 font-bold">DEAD LETTER</span>';
+          } else {
+            badge = '<span class="px-2 py-0.5 rounded text-[10px] bg-sky-500/10 text-sky-400 border border-sky-500/20">PENDING</span>';
+          }
+
+          const evType = d.event ? d.event.event_type : 'unknown';
+          const timeAgo = new Date(d.created_at).toLocaleTimeString();
+
+          return `
+            <tr class="hover:bg-slate-800/30 transition">
+              <td class="px-4 py-3 font-semibold text-slate-200 cursor-pointer text-indigo-400 hover:underline" onclick="inspectDelivery('${d.id}')">${d.id.substring(0, 14)}...</td>
+              <td class="px-4 py-3 text-emerald-400">${evType}</td>
+              <td class="px-4 py-3 text-slate-400 truncate max-w-[200px]" title="${d.endpoint_url}">${d.endpoint_url}</td>
+              <td class="px-4 py-3">${badge}</td>
+              <td class="px-4 py-3 text-slate-400">${d.attempts_count} / ${d.max_attempts}</td>
+              <td class="px-4 py-3 text-slate-500 text-[11px]">${timeAgo}</td>
+              <td class="px-4 py-3 text-right">
+                <button onclick="replayDelivery('${d.id}')" class="px-2.5 py-1 rounded bg-indigo-600/20 hover:bg-indigo-600/40 text-indigo-300 border border-indigo-500/30 text-[11px] transition">
+                  Replay ↺
+                </button>
+              </td>
+            </tr>
+          `;
+        }).join('');
+      } catch (err) {
+        console.error('Failed to fetch deliveries:', err);
+      }
+    }
+
+    async function injectSampleEvent() {
+      const tenant = document.getElementById('input-tenant').value.trim();
+      const eventType = document.getElementById('input-event-type').value.trim();
+      let payload;
+      try {
+        payload = JSON.parse(document.getElementById('input-payload').value);
+      } catch (e) {
+        alert('Invalid JSON payload');
+        return;
+      }
+
+      try {
+        const res = await fetch(`/v1/tenants/${tenant}/events`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ event_type: eventType, payload })
+        });
+        const out = await res.json();
+        alert(`Dispatched ${out.dispatched_count || 0} deliveries for event ${out.event ? out.event.id : ''}`);
+        fetchStats();
+        fetchDeliveries();
+      } catch (err) {
+        alert('Error publishing event: ' + err.message);
+      }
+    }
+
+    async function registerSampleEndpoint() {
+      const tenant = document.getElementById('input-tenant').value.trim();
+      // Ensure tenant exists
+      await fetch('/v1/tenants', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: "Demo Tenant" })
+      }).catch(() => {});
+
+      const res = await fetch(`/v1/tenants/${tenant}/endpoints`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          url: "https://httpbin.org/post",
+          description: "HttpBin Live Echo Endpoint",
+          event_types: ["*"],
+          max_retries: 4,
+          timeout_seconds: 5
+        })
+      });
+      const data = await res.json();
+      alert(`Endpoint created! ID: ${data.id}\nSecret: ${data.secret_key}`);
+    }
+
+    async function replayDelivery(id) {
+      try {
+        const res = await fetch(`/v1/deliveries/${id}/replay`, { method: 'POST' });
+        const data = await res.json();
+        alert(data.message || 'Replay scheduled');
+        fetchStats();
+        fetchDeliveries();
+      } catch (err) {
+        alert('Replay failed: ' + err.message);
+      }
+    }
+
+    async function inspectDelivery(id) {
+      try {
+        const res = await fetch(`/v1/deliveries/${id}`);
+        const data = await res.json();
+        const d = data.delivery;
+        const attempts = data.attempts || [];
+
+        document.getElementById('modal-title').innerText = `Delivery ${d.id}`;
+        document.getElementById('modal-url').innerText = d.endpoint_url;
+        document.getElementById('modal-payload').innerText = d.event ? JSON.stringify(d.event.payload, null, 2) : 'N/A';
+
+        const attemptsContainer = document.getElementById('modal-attempts');
+        if (attempts.length === 0) {
+          attemptsContainer.innerHTML = '<p class="text-slate-500 italic">No attempts logged yet (pending dispatch)</p>';
+        } else {
+          attemptsContainer.innerHTML = attempts.map(a => `
+            <div class="p-2.5 rounded bg-slate-950 border border-slate-800 space-y-1">
+              <div class="flex items-center justify-between text-[11px]">
+                <span class="font-bold text-slate-300">Attempt #${a.attempt_number} (HTTP ${a.response_status})</span>
+                <span class="text-slate-500">${a.latency_ms}ms • ${new Date(a.executed_at).toLocaleTimeString()}</span>
+              </div>
+              ${a.error_reason ? `<p class="text-rose-400 font-mono text-[10px]">Error: ${a.error_reason}</p>` : ''}
+              <div class="text-[10px] text-slate-400 truncate">Headers: ${JSON.stringify(a.request_headers)}</div>
+            </div>
+          `).join('');
+        }
+
+        document.getElementById('trace-modal').classList.remove('hidden');
+      } catch (err) {
+        alert('Failed to inspect delivery: ' + err.message);
+      }
+    }
+
+    function closeModal() {
+      document.getElementById('trace-modal').classList.add('hidden');
+    }
+
+    // Polling refresh
+    fetchStats();
+    fetchDeliveries();
+    setInterval(() => {
+      fetchStats();
+      fetchDeliveries();
+    }, 4000);
+  </script>
+</body>
+</html>

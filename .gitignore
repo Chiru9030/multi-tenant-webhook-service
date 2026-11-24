@@ -1,0 +1,9 @@
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+dist/
+bin/
+.DS_Store
+.env
+relay-server

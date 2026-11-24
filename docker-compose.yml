@@ -1,0 +1,23 @@
+version: '3.8'
+
+services:
+  relay-webhook-service:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: relay-webhook-service
+    ports:
+      - "8080:8080"
+    volumes:
+      - relay_data:/app/data
+    environment:
+      - PORT=8080
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+
+volumes:
+  relay_data:
