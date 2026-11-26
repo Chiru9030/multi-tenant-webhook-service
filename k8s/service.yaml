@@ -1,0 +1,14 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: webhook-service-svc
+  labels:
+    app: multi-tenant-webhook-service
+spec:
+  type: ClusterIP
+  selector:
+    app: multi-tenant-webhook-service
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8080

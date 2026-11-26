@@ -3,11 +3,17 @@ package dispatcher
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
+	"net/netip"
+	"net/url"
+	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/Chiru9030/multi-tenant-webhook-service/internal/backoff"
@@ -19,10 +25,11 @@ import (
 )
 
 type Config struct {
-	WorkerPoolSize int
-	PollInterval   time.Duration
-	BatchSize      int
-	BackoffConfig  backoff.BackoffConfig
+	WorkerPoolSize           int
+	PollInterval             time.Duration
+	BatchSize                int
+	BackoffConfig            backoff.BackoffConfig
+	AllowPrivateDestinations bool // Enables loopback/private targets strictly for local unit/integration tests.
 }
 
 type Dispatcher struct {
@@ -30,9 +37,52 @@ type Dispatcher struct {
 	httpClient *http.Client
 	cfg        Config
 	metrics    *metrics.Metrics
-	stopCh     chan struct{}
-	wg         sync.WaitGroup
-	workQueue  chan model.Delivery
+
+	stopCh    chan struct{}
+	stopOnce  sync.Once
+	wg        sync.WaitGroup
+	workQueue chan model.Delivery
+}
+
+func isDisallowedAddr(addr netip.Addr) bool {
+	addr = addr.Unmap()
+	return addr.IsLoopback() ||
+		addr.IsPrivate() ||
+		addr.IsLinkLocalUnicast() ||
+		addr.IsLinkLocalMulticast() ||
+		addr.IsMulticast() ||
+		addr.IsUnspecified()
+}
+
+// ValidateDestinationURL checks scheme, host, literal IPs, and DNS resolution against SSRF targets.
+func ValidateDestinationURL(raw string, allowPrivate bool) (string, error) {
+	trimmed := strings.TrimSpace(raw)
+	parsed, err := url.ParseRequestURI(trimmed)
+	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" {
+		return "", errors.New("invalid webhook destination URL; must be http:// or https://")
+	}
+	host := strings.TrimSuffix(strings.ToLower(parsed.Hostname()), ".")
+	if host == "" {
+		return "", errors.New("webhook URL must contain a valid hostname")
+	}
+	if !allowPrivate {
+		if host == "localhost" || strings.HasSuffix(host, ".localhost") ||
+			strings.HasSuffix(host, ".local") || strings.HasSuffix(host, ".internal") {
+			return "", errors.New("private or local webhook destination hostnames are prohibited")
+		}
+		if ip, err := netip.ParseAddr(host); err == nil {
+			if isDisallowedAddr(ip) {
+				return "", errors.New("private, loopback, or link-local IP webhook targets are prohibited")
+			}
+		} else if ips, lookupErr := net.LookupIP(host); lookupErr == nil {
+			for _, ip := range ips {
+				if addr, ok := netip.AddrFromSlice(ip); ok && isDisallowedAddr(addr) {
+					return "", errors.New("webhook destination hostname resolves to prohibited internal network")
+				}
+			}
+		}
+	}
+	return trimmed, nil
 }
 
 func NewDispatcher(store *storage.Store, m *metrics.Metrics, cfg Config) *Dispatcher {
@@ -49,22 +99,50 @@ func NewDispatcher(store *storage.Store, m *metrics.Metrics, cfg Config) *Dispat
 		cfg.BackoffConfig = backoff.DefaultConfig
 	}
 
+	dialer := &net.Dialer{Timeout: 5 * time.Second, KeepAlive: 30 * time.Second}
+	if !cfg.AllowPrivateDestinations {
+		dialer.Control = func(_, address string, _ syscall.RawConn) error {
+			host, _, err := net.SplitHostPort(address)
+			if err != nil {
+				host = address
+			}
+			addr, err := netip.ParseAddr(host)
+			if err != nil || isDisallowedAddr(addr) {
+				return errors.New("ssrf protection blocked connection to non-public IP")
+			}
+			return nil
+		}
+	}
+
 	transport := &http.Transport{
+		DialContext:         dialer.DialContext,
 		MaxIdleConns:        100,
 		MaxIdleConnsPerHost: 20,
 		IdleConnTimeout:     90 * time.Second,
+	}
+
+	queueCap := cfg.WorkerPoolSize * 2
+	if queueCap < cfg.BatchSize {
+		queueCap = cfg.BatchSize
 	}
 
 	return &Dispatcher{
 		store: store,
 		httpClient: &http.Client{
 			Transport: transport,
-			Timeout:   10 * time.Second,
+			Timeout:   0, // Enforced per-delivery via request context timeout (endpoint.TimeoutSeconds).
+			CheckRedirect: func(req *http.Request, via []*http.Request) error {
+				if len(via) >= 3 {
+					return errors.New("too many redirects")
+				}
+				_, err := ValidateDestinationURL(req.URL.String(), cfg.AllowPrivateDestinations)
+				return err
+			},
 		},
 		cfg:       cfg,
 		metrics:   m,
 		stopCh:    make(chan struct{}),
-		workQueue: make(chan model.Delivery, cfg.WorkerPoolSize*2),
+		workQueue: make(chan model.Delivery, queueCap),
 	}
 }
 
@@ -79,9 +157,11 @@ func (d *Dispatcher) Start() {
 	go d.pollLoop()
 }
 
-// Stop gracefully stops all workers and waits for in-flight deliveries to complete.
+// Stop gracefully stops all workers idempotently and waits for in-flight deliveries to complete.
 func (d *Dispatcher) Stop() {
-	close(d.stopCh)
+	d.stopOnce.Do(func() {
+		close(d.stopCh)
+	})
 	d.wg.Wait()
 }
 
@@ -96,8 +176,16 @@ func (d *Dispatcher) pollLoop() {
 			close(d.workQueue)
 			return
 		case <-ticker.C:
+			available := cap(d.workQueue) - len(d.workQueue)
+			if available <= 0 {
+				continue
+			}
+			fetchLimit := d.cfg.BatchSize
+			if available < fetchLimit {
+				fetchLimit = available
+			}
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			due, err := d.store.FetchDueDeliveries(ctx, d.cfg.BatchSize)
+			due, err := d.store.FetchDueDeliveries(ctx, fetchLimit)
 			cancel()
 
 			if err != nil {
@@ -121,7 +209,7 @@ func (d *Dispatcher) pollLoop() {
 	}
 }
 
-func (d *Dispatcher) workerLoop(workerID int) {
+func (d *Dispatcher) workerLoop(_ int) {
 	defer d.wg.Done()
 
 	for del := range d.workQueue {
@@ -138,9 +226,12 @@ func (d *Dispatcher) workerLoop(workerID int) {
 }
 
 func (d *Dispatcher) executeDelivery(ctx context.Context, del model.Delivery) {
-	// 1. Fetch endpoint info for secret & config
 	endpoint, err := d.store.GetEndpoint(ctx, del.EndpointID)
-	if err != nil || endpoint == nil || !endpoint.IsActive {
+	if err != nil {
+		log.Printf("[Dispatcher] Transient error reading endpoint %s: %v", del.EndpointID, err)
+		return
+	}
+	if endpoint == nil || !endpoint.IsActive {
 		_ = d.store.UpdateDeliveryStatus(ctx, del.ID, model.StatusDeadLetter, del.AttemptsCount, nil, "Endpoint not found or inactive")
 		if d.metrics != nil {
 			d.metrics.DeadLetterCount.WithLabelValues(del.TenantID, del.EndpointID).Inc()
@@ -148,13 +239,16 @@ func (d *Dispatcher) executeDelivery(ctx context.Context, del model.Delivery) {
 		return
 	}
 
-	// 2. Fetch event payload if not loaded
 	var payload []byte
 	if del.Event != nil && len(del.Event.Payload) > 0 {
 		payload = del.Event.Payload
 	} else {
 		ev, err := d.store.GetEvent(ctx, del.EventID)
-		if err != nil || ev == nil {
+		if err != nil {
+			log.Printf("[Dispatcher] Transient error reading event %s: %v", del.EventID, err)
+			return
+		}
+		if ev == nil {
 			_ = d.store.UpdateDeliveryStatus(ctx, del.ID, model.StatusDeadLetter, del.AttemptsCount, nil, "Event payload missing")
 			return
 		}
@@ -204,17 +298,14 @@ func (d *Dispatcher) executeDelivery(ctx context.Context, del model.Delivery) {
 	}
 	defer resp.Body.Close()
 
-	bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 1024*4)) // limit 4KB preview
+	bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 1024*4))
 	bodyPreview := string(bodyBytes)
 
 	if resp.StatusCode >= 200 && resp.StatusCode <= 299 {
-		// SUCCESS!
 		d.handleSuccess(ctx, del, attemptNum, resp.StatusCode, latencyMs, reqHeaders, bodyPreview)
 	} else if resp.StatusCode == 429 || resp.StatusCode >= 500 {
-		// Transient retryable failure (rate limited or server error)
 		d.handleFailure(ctx, del, attemptNum, resp.StatusCode, latencyMs, reqHeaders, bodyPreview, fmt.Sprintf("HTTP %d", resp.StatusCode))
 	} else {
-		// 4xx client errors (400, 401, 404) are permanent; no point in retrying bad endpoint URL/auth
 		d.handlePermanentFailure(ctx, del, attemptNum, resp.StatusCode, latencyMs, reqHeaders, bodyPreview, fmt.Sprintf("HTTP %d (permanent client error)", resp.StatusCode))
 	}
 }
@@ -234,7 +325,7 @@ func (d *Dispatcher) handleSuccess(ctx context.Context, del model.Delivery, atte
 	_ = d.store.UpdateDeliveryStatus(ctx, del.ID, model.StatusSuccess, attemptNum, nil, "")
 
 	if d.metrics != nil {
-		d.metrics.DeliveryAttempts.WithLabelValues(del.TenantID, "2xx", "success").Inc()
+		d.metrics.DeliveryAttempts.WithLabelValues(del.TenantID, "success", fmt.Sprintf("%d", statusCode)).Inc()
 		d.metrics.DeliveryLatency.WithLabelValues(del.TenantID).Observe(float64(latencyMs) / 1000.0)
 	}
 }
@@ -251,29 +342,26 @@ func (d *Dispatcher) handleFailure(ctx context.Context, del model.Delivery, atte
 		ErrorReason:    reason,
 	})
 
+	if d.metrics != nil {
+		codeStr := fmt.Sprintf("%d", statusCode)
+		if statusCode == 0 {
+			codeStr = "network_err"
+		}
+		d.metrics.DeliveryAttempts.WithLabelValues(del.TenantID, "failed", codeStr).Inc()
+		d.metrics.DeliveryLatency.WithLabelValues(del.TenantID).Observe(float64(latencyMs) / 1000.0)
+	}
+
 	if attemptNum >= del.MaxAttempts {
-		// DLQ escalation
-		_ = d.store.UpdateDeliveryStatus(ctx, del.ID, model.StatusDeadLetter, attemptNum, nil, reason)
+		_ = d.store.UpdateDeliveryStatus(ctx, del.ID, model.StatusDeadLetter, attemptNum, nil, fmt.Sprintf("Max retries reached (%d). Last error: %s", del.MaxAttempts, reason))
 		if d.metrics != nil {
 			d.metrics.DeadLetterCount.WithLabelValues(del.TenantID, del.EndpointID).Inc()
-			d.metrics.DeliveryAttempts.WithLabelValues(del.TenantID, "dlq", "failed").Inc()
 		}
-	} else {
-		// Schedule retry with exponential backoff and full jitter
-		nextDelay := backoff.CalculateNextRetry(attemptNum, d.cfg.BackoffConfig)
-		nextRetryAt := time.Now().UTC().Add(nextDelay)
-		_ = d.store.UpdateDeliveryStatus(ctx, del.ID, model.StatusRetrying, attemptNum, &nextRetryAt, reason)
-
-		if d.metrics != nil {
-			statusClass := "5xx"
-			if statusCode == 429 {
-				statusClass = "429"
-			} else if statusCode == 0 {
-				statusClass = "network_err"
-			}
-			d.metrics.DeliveryAttempts.WithLabelValues(del.TenantID, statusClass, "retry_scheduled").Inc()
-		}
+		return
 	}
+
+	delay := backoff.CalculateNextRetry(attemptNum, d.cfg.BackoffConfig)
+	nextRetry := time.Now().UTC().Add(delay)
+	_ = d.store.UpdateDeliveryStatus(ctx, del.ID, model.StatusRetrying, attemptNum, &nextRetry, reason)
 }
 
 func (d *Dispatcher) handlePermanentFailure(ctx context.Context, del model.Delivery, attemptNum, statusCode int, latencyMs int64, headers map[string]string, body, reason string) {
@@ -288,9 +376,10 @@ func (d *Dispatcher) handlePermanentFailure(ctx context.Context, del model.Deliv
 		ErrorReason:    reason,
 	})
 
-	_ = d.store.UpdateDeliveryStatus(ctx, del.ID, model.StatusDeadLetter, attemptNum, nil, reason)
 	if d.metrics != nil {
+		d.metrics.DeliveryAttempts.WithLabelValues(del.TenantID, "permanent_error", fmt.Sprintf("%d", statusCode)).Inc()
 		d.metrics.DeadLetterCount.WithLabelValues(del.TenantID, del.EndpointID).Inc()
-		d.metrics.DeliveryAttempts.WithLabelValues(del.TenantID, "4xx", "permanent_failure").Inc()
 	}
+
+	_ = d.store.UpdateDeliveryStatus(ctx, del.ID, model.StatusDeadLetter, attemptNum, nil, reason)
 }

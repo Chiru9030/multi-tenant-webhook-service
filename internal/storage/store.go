@@ -25,8 +25,8 @@ func NewStore(dbPath string) (*Store, error) {
 		return nil, fmt.Errorf("failed to open database: %w", err)
 	}
 
-	db.SetMaxOpenConns(25)
-	db.SetMaxIdleConns(10)
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
 	db.SetConnMaxLifetime(10 * time.Minute)
 
 	s := &Store{db: db}
@@ -40,6 +40,10 @@ func NewStore(dbPath string) (*Store, error) {
 
 func (s *Store) Close() error {
 	return s.db.Close()
+}
+
+func (s *Store) Ping(ctx context.Context) error {
+	return s.db.PingContext(ctx)
 }
 
 func (s *Store) migrate() error {
@@ -277,25 +281,40 @@ func (s *Store) CreateEvent(ctx context.Context, ev *model.Event) (bool, error) 
 	now := time.Now().UTC()
 	ev.CreatedAt = now
 
-	// Check idempotency if key provided
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = tx.Rollback() }()
+
 	if ev.IdempotencyKey != "" {
-		var existingID string
-		err := s.db.QueryRowContext(ctx,
-			`SELECT id FROM events WHERE tenant_id = ? AND idempotency_key = ?`,
+		var existingID, existingType, payloadStr string
+		var createdAt time.Time
+		err := tx.QueryRowContext(ctx,
+			`SELECT id, event_type, payload, created_at FROM events WHERE tenant_id = ? AND idempotency_key = ?`,
 			ev.TenantID, ev.IdempotencyKey,
-		).Scan(&existingID)
+		).Scan(&existingID, &existingType, &payloadStr, &createdAt)
 		if err == nil {
 			ev.ID = existingID
-			return false, nil // Duplicate event, existing returned
+			ev.EventType = existingType
+			ev.Payload = []byte(payloadStr)
+			ev.CreatedAt = createdAt
+			return false, nil
 		}
 	}
 
-	_, err := s.db.ExecContext(ctx,
+	_, err = tx.ExecContext(ctx,
 		`INSERT INTO events (id, tenant_id, event_type, idempotency_key, payload, created_at)
 		 VALUES (?, ?, ?, ?, ?, ?)`,
 		ev.ID, ev.TenantID, ev.EventType, sqlNullString(ev.IdempotencyKey), string(ev.Payload), ev.CreatedAt,
 	)
 	if err != nil {
+		return false, err
+	}
+	if err := tx.Commit(); err != nil {
 		return false, err
 	}
 	return true, nil
@@ -387,16 +406,32 @@ func (s *Store) UpdateDeliveryStatus(ctx context.Context, id string, status mode
 
 func (s *Store) FetchDueDeliveries(ctx context.Context, limit int) ([]model.Delivery, error) {
 	now := time.Now().UTC()
-	rows, err := s.db.QueryContext(ctx,
+	staleCutoff := now.Add(-120 * time.Second)
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	// Reclaim stale 'sending' deliveries whose worker crashed >60s ago
+	_, _ = tx.ExecContext(ctx,
+		`UPDATE deliveries SET status = 'pending', updated_at = ? WHERE status = 'sending' AND updated_at <= ?`,
+		now, staleCutoff,
+	)
+
+	rows, err := tx.QueryContext(ctx,
 		`SELECT id, tenant_id, event_id, endpoint_id, endpoint_url, status, attempts_count, max_attempts, next_retry_at, last_attempt_at, last_error, created_at, updated_at
-		 FROM deliveries 
+		 FROM deliveries
 		 WHERE (status = 'pending' OR (status = 'retrying' AND next_retry_at <= ?))
 		 ORDER BY created_at ASC LIMIT ?`, now, limit,
 	)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
 
 	var list []model.Delivery
 	for rows.Next() {
@@ -408,6 +443,7 @@ func (s *Store) FetchDueDeliveries(ctx context.Context, limit int) ([]model.Deli
 			&d.ID, &d.TenantID, &d.EventID, &d.EndpointID, &d.EndpointURL, &status,
 			&d.AttemptsCount, &d.MaxAttempts, &nextRetry, &lastAttempt, &lastErr, &d.CreatedAt, &d.UpdatedAt,
 		); err != nil {
+			rows.Close()
 			return nil, err
 		}
 		d.Status = model.DeliveryStatus(status)
@@ -420,14 +456,34 @@ func (s *Store) FetchDueDeliveries(ctx context.Context, limit int) ([]model.Deli
 		if lastErr.Valid {
 			d.LastError = lastErr.String
 		}
-
-		// Enrich event
-		ev, _ := s.GetEvent(ctx, d.EventID)
-		d.Event = ev
-
 		list = append(list, d)
 	}
-	return list, rows.Err()
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, err
+	}
+	rows.Close()
+
+	// Atomically claim claimed deliveries as 'sending' so concurrent pollers never double-dispatch
+	for i := range list {
+		if _, err := tx.ExecContext(ctx,
+			`UPDATE deliveries SET status = 'sending', updated_at = ? WHERE id = ?`,
+			now, list[i].ID,
+		); err != nil {
+			return nil, err
+		}
+		list[i].Status = model.StatusSending
+	}
+
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+
+	for i := range list {
+		ev, _ := s.GetEvent(ctx, list[i].EventID)
+		list[i].Event = ev
+	}
+	return list, nil
 }
 
 func (s *Store) ListDeliveries(ctx context.Context, tenantID string, status model.DeliveryStatus, limit, offset int) ([]model.Delivery, error) {
@@ -479,12 +535,18 @@ func (s *Store) ListDeliveries(ctx context.Context, tenantID string, status mode
 			d.LastError = lastErr.String
 		}
 
-		ev, _ := s.GetEvent(ctx, d.EventID)
-		d.Event = ev
-
 		list = append(list, d)
 	}
-	return list, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	rows.Close()
+
+	for i := range list {
+		ev, _ := s.GetEvent(ctx, list[i].EventID)
+		list[i].Event = ev
+	}
+	return list, nil
 }
 
 // ResetForReplay resets a delivery back to pending status for immediate re-execution.
@@ -606,10 +668,10 @@ func (s *Store) GetStats(ctx context.Context, tenantID string) (*model.Stats, er
 		stats.SuccessRatePct = (float64(stats.SuccessfulCount) / float64(stats.TotalDeliveries)) * 100.0
 	}
 
-	// Avg latency
-	latQuery := `SELECT AVG(latency_ms) FROM attempts`
+	// Tenant-scoped average latency when tenantID filter is provided
+	latQuery := `SELECT AVG(a.latency_ms) FROM attempts a JOIN deliveries d ON a.delivery_id = d.id` + where
 	var avgLat sql.NullFloat64
-	_ = s.db.QueryRowContext(ctx, latQuery).Scan(&avgLat)
+	_ = s.db.QueryRowContext(ctx, latQuery, args...).Scan(&avgLat)
 	if avgLat.Valid {
 		stats.AvgLatencyMs = avgLat.Float64
 	}

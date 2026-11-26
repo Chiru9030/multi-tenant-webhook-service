@@ -8,11 +8,13 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 	"time"
 
 	"github.com/Chiru9030/multi-tenant-webhook-service/internal/api"
 	"github.com/Chiru9030/multi-tenant-webhook-service/internal/backoff"
+	"github.com/Chiru9030/multi-tenant-webhook-service/internal/crypto"
 	"github.com/Chiru9030/multi-tenant-webhook-service/internal/dispatcher"
 	"github.com/Chiru9030/multi-tenant-webhook-service/internal/metrics"
 	"github.com/Chiru9030/multi-tenant-webhook-service/internal/model"
@@ -27,6 +29,18 @@ func main() {
 	workers := flag.Int("workers", 10, "Worker pool size for dispatching webhooks")
 	pollInterval := flag.Duration("poll", 1*time.Second, "Polling interval for pending deliveries")
 	flag.Parse()
+
+	visited := map[string]bool{}
+	flag.Visit(func(f *flag.Flag) { visited[f.Name] = true })
+
+	if envPort := os.Getenv("PORT"); envPort != "" && !visited["port"] {
+		if parsed, convErr := strconv.Atoi(envPort); convErr == nil && parsed > 0 {
+			*port = parsed
+		}
+	}
+	if envDB := os.Getenv("DB_PATH"); envDB != "" && !visited["db"] {
+		*dbPath = envDB
+	}
 
 	log.Printf("Starting Relay Multi-Tenant Webhook Service on port %d...", *port)
 
@@ -53,7 +67,6 @@ func main() {
 	}
 	disp := dispatcher.NewDispatcher(store, appMetrics, dispConfig)
 	disp.Start()
-	defer disp.Stop()
 
 	// 4. Embedded Web Static Assets
 	staticFS, err := web.GetStaticFS()
@@ -62,7 +75,14 @@ func main() {
 	}
 
 	// 5. HTTP API Server
-	apiServer := api.NewServer(store, disp, appMetrics, staticFS)
+	apiServer := api.NewServerWithConfig(
+		store,
+		disp,
+		appMetrics,
+		staticFS,
+		os.Getenv("WEBHOOK_ADMIN_API_KEY"),
+		os.Getenv("ALLOWED_ORIGINS"),
+	)
 	httpServer := &http.Server{
 		Addr:         fmt.Sprintf(":%d", *port),
 		Handler:      apiServer.Handler(),
@@ -97,6 +117,10 @@ func seedDemoData(store *storage.Store) {
 	ctx := context.Background()
 	existing, _ := store.GetTenant(ctx, "ten_demo")
 	if existing == nil {
+		demoSecret := os.Getenv("DEMO_WEBHOOK_SECRET")
+		if demoSecret == "" {
+			demoSecret, _ = crypto.GenerateSecretKey()
+		}
 		_ = store.CreateTenant(ctx, &model.Tenant{
 			ID:   "ten_demo",
 			Name: "Acme Payments Demo",
@@ -106,7 +130,7 @@ func seedDemoData(store *storage.Store) {
 			TenantID:       "ten_demo",
 			URL:            "https://httpbin.org/post",
 			Description:    "HttpBin Echo Demo Receiver",
-			SecretKey:      "whsec_e08d8174f74d0a92fcebb61d8b679657a8bf60e1d1487f95",
+			SecretKey:      demoSecret,
 			EventTypes:     []string{"*"},
 			IsActive:       true,
 			MaxRetries:     3,

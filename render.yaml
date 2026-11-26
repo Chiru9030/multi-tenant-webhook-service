@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: multi-tenant-webhook-service
+    runtime: docker
+    plan: free
+    healthCheckPath: /healthz
+    # Note: Render free plan uses ephemeral filesystem (/app/data/webhooks.db); upgrade plan & mount a persistent disk for durable SQLite storage across restarts.
+    envVars:
+      - key: PORT
+        value: "8080"
+      - key: DB_PATH
+        value: /app/data/webhooks.db
+      - key: WEBHOOK_ADMIN_API_KEY
+        generateValue: true
+      - key: DEMO_WEBHOOK_SECRET
+        generateValue: true

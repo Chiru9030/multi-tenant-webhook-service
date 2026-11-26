@@ -1,6 +1,6 @@
 # ⚡ Relay: Multi-Tenant Webhook & Event Delivery Engine
 
-[![Go Version](https://img.shields.io/badge/Go-1.24%2B-00ADD8?style=flat&logo=go)](https://golang.org)
+[![Go Version](https://img.shields.io/badge/Go-1.26%2B-00ADD8?style=flat&logo=go)](https://golang.org)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Build Status](https://img.shields.io/badge/tests-passing-brightgreen)](https://github.com/Chiru9030/multi-tenant-webhook-service)
 [![Concurrency](https://img.shields.io/badge/concurrency--safe-verified%20with%20--race-success)](https://golang.org)
@@ -95,12 +95,15 @@ Relay compiles a modern dark-mode monitoring dashboard directly into the binary:
 ```bash
 git clone https://github.com/Chiru9030/multi-tenant-webhook-service.git
 cd multi-tenant-webhook-service
+cp .env.example .env
+set -a && source .env && set +a
 
-# Run all unit, integration & race tests
-go test -v -race ./...
+# Run all unit, integration & concurrency race tests
+go vet ./...
+go test -v -race -count=1 ./...
 
-# Start server
-go run cmd/server/main.go --port=8080 --workers=15
+# Start server (WEBHOOK_ADMIN_API_KEY protects /v1/* routes)
+go run ./cmd/server -port=8080 -workers=15
 ```
 
 Open your browser at **[http://localhost:8080/dashboard/](http://localhost:8080/dashboard/)**.
@@ -111,15 +114,44 @@ Open your browser at **[http://localhost:8080/dashboard/](http://localhost:8080/
 docker compose up --build -d
 ```
 
-Verify service health:
+Verify liveness and SQLite readiness:
 ```bash
 curl http://localhost:8080/healthz
 # {"service":"relay-webhook-service","status":"healthy"}
+
+curl http://localhost:8080/readyz
+# {"database":"sqlite_wal_ok","status":"ready"}
 ```
+
+### Option C: Production Deployments (Kubernetes, Render, Linux VM)
+- **Kubernetes (`k8s/`):** Deploys a single-replica `StatefulSet` backed by a `5Gi` `ReadWriteOnce` PVC (`k8s/statefulset.yaml`), `ConfigMap` (`k8s/configmap.yaml`), `ClusterIP` `Service` (`k8s/service.yaml`), non-root container (`UID 10001`), `/healthz` liveness probe, and `/readyz` readiness probe (avoiding SQLite WAL split-brain).
+- **Cloud (`render.yaml`):** Render Docker Blueprint with `/healthz` checks and auto-generated `WEBHOOK_ADMIN_API_KEY` & `DEMO_WEBHOOK_SECRET` (uses ephemeral SQLite on the free plan; attach a persistent disk on paid plans for durable storage across deploys).
+- **Linux VM (`deploy/vm/provision.sh`):** Builds a stripped static binary (`CGO_ENABLED=0`), provisions a locked `webhooksvc` service user, and installs a hardened `systemd` unit (`NoNewPrivileges=true`, `ProtectSystem=strict`).
+- **CI/CD (`.github/workflows/ci.yml`):** Automated `go vet`, `go build`, `go test -v -race -count=1 ./...`, and Docker image build verification on push/PR.
+
+---
+
+## ⚙️ Configuration & Security
+
+| Variable | Default | Description |
+| :--- | :--- | :--- |
+| `PORT` | `8080` | HTTP server listen port (used when `-port` stays default) |
+| `DB_PATH` | `webhooks.db` | SQLite WAL database path |
+| `WEBHOOK_ADMIN_API_KEY` | *(unset)* | Optional bearer / `X-API-Key` secret protecting `/v1/*` APIs via SHA-256 constant-time comparison (`/healthz`, `/readyz`, `/metrics`, and `/dashboard/` remain accessible) |
+| `ALLOWED_ORIGINS` | `*` | Single origin or comma-separated CORS allowlist emitting `Vary: Origin` |
+| `DEMO_WEBHOOK_SECRET` | *(random generated)* | Optional deterministic HMAC secret for seeded demo endpoint |
+
+Security hardening in `v1.0.0`:
+- Atomic transactional SQLite delivery claims (`status = 'sending'`) bounded by worker queue headroom + `120s` stale-claim recovery prevent duplicate webhook dispatches under concurrent pollers.
+- Full SSRF protection blocks loopback (`127.0.0.0/8`, `::1`, `localhost`), RFC1918/ULA private ranges, link-local cloud metadata (`169.254.169.254`), DNS-rebinding at dial time (`net.Dialer.Control`), and unsafe HTTP redirects on outbound webhooks.
+- Single-writer SQLite connection pool (`SetMaxOpenConns(1)`) prevents `SQLITE_BUSY` errors and eliminates TOCTOU races in idempotent event creation.
+- Per-request timeouts honoring `endpoint.TimeoutSeconds` (`1–60s`), `1 MiB` request body cap (`413` on overflow) across tenant/endpoint/event ingestion, tenant-isolated stats aggregation, XSS-safe DOM rendering (`textContent`), and `X-Content-Type-Options`/`X-Frame-Options`/`Referrer-Policy` headers.
 
 ---
 
 ## 📡 API Reference
+
+*(Pass `Authorization: Bearer <WEBHOOK_ADMIN_API_KEY>` or `X-API-Key: <WEBHOOK_ADMIN_API_KEY>` when `WEBHOOK_ADMIN_API_KEY` is configured.)*
 
 ### 1. Register a Tenant
 ```bash
@@ -161,13 +193,16 @@ Idempotency-Key: evt_ord_102948290
 }
 ```
 
-### 4. Manual Delivery Replay
+### 4. Manual & Bulk Delivery Replay
 ```bash
 POST /v1/deliveries/:delivery_id/replay
+POST /v1/endpoints/:endpoint_id/replay-all
 ```
 
-### 5. Prometheus Telemetry
+### 5. Health, Readiness & Prometheus Telemetry
 ```bash
+GET /healthz
+GET /readyz
 GET /metrics
 ```
 Metrics exported:
@@ -182,32 +217,23 @@ Metrics exported:
 
 ## 🧪 Testing & Verification
 
-The test suite covers full lifecycle end-to-end execution, wildcard subscription matching, idempotent ingestion, retry scheduling, and race conditions:
+The test suite verifies backoff math, HMAC signature/replay checks, SQLite WAL storage CRUD, idempotent event ingestion, single-delivery transactional locking under concurrency, DLQ escalation, replay APIs, `/readyz`, admin API-key enforcement, security headers, and destination URL validation:
 
 ```bash
-go test -v -race ./...
+go test -v -race -count=1 ./...
 ```
 
-Output:
-```
-=== RUN   TestSignAndVerifySignature
---- PASS: TestSignAndVerifySignature (0.00s)
-=== RUN   TestCalculateNextRetry
---- PASS: TestCalculateNextRetry (0.00s)
-=== RUN   TestTenantAndEndpointCRUD
---- PASS: TestTenantAndEndpointCRUD (0.03s)
-=== RUN   TestEventIdempotency
---- PASS: TestEventIdempotency (0.02s)
-=== RUN   TestDeliveryLifecycleAndDLQReplay
---- PASS: TestDeliveryLifecycleAndDLQReplay (0.03s)
-=== RUN   TestEndToEndSuccessfulDelivery
---- PASS: TestEndToEndSuccessfulDelivery (0.12s)
-=== RUN   TestRetryAndDLQEscalation
---- PASS: TestRetryAndDLQEscalation (1.19s)
-=== RUN   TestManualReplayAPI
---- PASS: TestManualReplayAPI (0.20s)
-PASS ok  github.com/Chiru9030/multi-tenant-webhook-service
-```
+Covered tests across `internal/backoff`, `internal/crypto`, `internal/storage`, and `tests`:
+- `TestCalculateNextRetry`
+- `TestSignAndVerifySignature`
+- `TestTenantAndEndpointCRUD`
+- `TestEventIdempotency`
+- `TestDeliveryLifecycleAndDLQReplay`
+- `TestEndToEndSuccessfulDelivery`
+- `TestRetryAndDLQEscalation`
+- `TestManualReplayAPI`
+- `TestAdminAuthReadyzSecurityHeadersAndURLValidation`
+- `TestWebhookAuditRegressions` (covers idempotent `Dispatcher.Stop()`, SSRF blocking, `1 MiB` `413` body limits, JSON `null`/`404` checks, concurrent `Idempotency-Key` race hydration, exclusive concurrent `FetchDueDeliveries` locking, `replay-all`, comma CORS + `Vary: Origin`, and tenant-isolated latency stats)
 
 ---
 

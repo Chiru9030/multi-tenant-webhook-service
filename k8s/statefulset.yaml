@@ -1,0 +1,71 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: webhook-service
+  labels:
+    app: multi-tenant-webhook-service
+spec:
+  serviceName: webhook-service-svc
+  replicas: 1
+  selector:
+    matchLabels:
+      app: multi-tenant-webhook-service
+  template:
+    metadata:
+      labels:
+        app: multi-tenant-webhook-service
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        fsGroup: 10001
+      containers:
+        - name: webhook-service
+          image: ghcr.io/chiru9030/multi-tenant-webhook-service:v1.0.0
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8080
+              name: http
+          envFrom:
+            - configMapRef:
+                name: webhook-service-config
+          env:
+            - name: WEBHOOK_ADMIN_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: webhook-service-secrets
+                  key: WEBHOOK_ADMIN_API_KEY
+                  optional: true
+          securityContext:
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 15
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 8080
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          volumeMounts:
+            - name: data
+              mountPath: /app/data
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 5Gi

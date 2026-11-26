@@ -3,11 +3,13 @@ package tests
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -39,9 +41,10 @@ func setupTestApp(t *testing.T) (*api.Server, *dispatcher.Dispatcher, *storage.S
 
 	m := metrics.NewMetrics(prometheus.NewRegistry())
 	dispConfig := dispatcher.Config{
-		WorkerPoolSize: 4,
-		PollInterval:   50 * time.Millisecond,
-		BatchSize:      10,
+		WorkerPoolSize:           4,
+		PollInterval:             50 * time.Millisecond,
+		BatchSize:                10,
+		AllowPrivateDestinations: true,
 		BackoffConfig: backoff.BackoffConfig{
 			BaseInterval: 100 * time.Millisecond,
 			MaxInterval:  500 * time.Millisecond,
@@ -51,7 +54,7 @@ func setupTestApp(t *testing.T) (*api.Server, *dispatcher.Dispatcher, *storage.S
 	disp := dispatcher.NewDispatcher(store, m, dispConfig)
 	disp.Start()
 
-	server := api.NewServer(store, disp, m, nil)
+	server := api.NewServerWithOptions(store, disp, m, nil, api.ServerOptions{AllowPrivateDestinations: true})
 
 	cleanup := func() {
 		disp.Stop()
@@ -69,11 +72,14 @@ func TestEndToEndSuccessfulDelivery(t *testing.T) {
 	// 1. Setup mock receiver with signature verification
 	var receivedPayload []byte
 	var receivedSig string
+	var deliveryHits int64
 	var mu sync.Mutex
+	var once sync.Once
 	receiverDone := make(chan struct{})
 
 	const endpointSecret = "whsec_supersecretkey1234567890abcdef"
 	receiver := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt64(&deliveryHits, 1)
 		body, _ := io.ReadAll(r.Body)
 		sig := r.Header.Get("X-Webhook-Signature")
 
@@ -91,7 +97,7 @@ func TestEndToEndSuccessfulDelivery(t *testing.T) {
 
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte(`{"received": true}`))
-		close(receiverDone)
+		once.Do(func() { close(receiverDone) })
 	}))
 	defer receiver.Close()
 
@@ -149,6 +155,9 @@ func TestEndToEndSuccessfulDelivery(t *testing.T) {
 
 	if deliveries[0].AttemptsCount != 1 {
 		t.Errorf("expected 1 attempt, got %d", deliveries[0].AttemptsCount)
+	}
+	if hits := atomic.LoadInt64(&deliveryHits); hits != 1 {
+		t.Fatalf("expected exactly 1 webhook delivery without duplicate dispatch, got %d", hits)
 	}
 
 	// 5. Verify Attempt audit record exists
@@ -299,3 +308,244 @@ func TestManualReplayAPI(t *testing.T) {
 		t.Errorf("expected receiver to receive replayed webhook successfully")
 	}
 }
+
+func TestAdminAuthReadyzSecurityHeadersAndURLValidation(t *testing.T) {
+	f, err := os.CreateTemp("", "auth_wh_*.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dbPath := f.Name()
+	f.Close()
+	defer os.Remove(dbPath)
+
+	store, err := storage.NewStore(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	m := metrics.NewMetrics(prometheus.NewRegistry())
+	disp := dispatcher.NewDispatcher(store, m, dispatcher.Config{WorkerPoolSize: 2, PollInterval: 50 * time.Millisecond})
+	srv := api.NewServerWithConfig(store, disp, m, nil, "admin_secret_v1", "https://dashboard.example.com")
+
+	// /healthz and /readyz remain public with security headers
+	for _, probe := range []string{"/healthz", "/readyz"} {
+		req := httptest.NewRequest(http.MethodGet, probe, nil)
+		rec := httptest.NewRecorder()
+		srv.Handler().ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("expected 200 on %s, got %d", probe, rec.Code)
+		}
+		if rec.Header().Get("X-Content-Type-Options") != "nosniff" {
+			t.Fatalf("missing security header on %s", probe)
+		}
+		if rec.Header().Get("Access-Control-Allow-Origin") != "https://dashboard.example.com" {
+			t.Fatalf("unexpected CORS origin: %s", rec.Header().Get("Access-Control-Allow-Origin"))
+		}
+	}
+
+	// Missing key rejected with 401
+	unauth := httptest.NewRequest(http.MethodGet, "/v1/tenants", nil)
+	uRec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(uRec, unauth)
+	if uRec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 without API key, got %d", uRec.Code)
+	}
+
+	// Authorized tenant creation + invalid URL rejection
+	_ = store.CreateTenant(context.Background(), &model.Tenant{ID: "ten_sec", Name: "Sec Tenant"})
+	badEp := httptest.NewRequest(http.MethodPost, "/v1/tenants/ten_sec/endpoints", bytes.NewBufferString(`{"url":"ftp://invalid.local/hook"}`))
+	badEp.Header.Set("Content-Type", "application/json")
+	badEp.Header.Set("X-API-Key", "admin_secret_v1")
+	badRec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(badRec, badEp)
+	if badRec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 BadRequest for non-http URL scheme, got %d", badRec.Code)
+	}
+}
+
+func TestWebhookAuditRegressions(t *testing.T) {
+	f, err := os.CreateTemp("", "regress_wh_*.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dbPath := f.Name()
+	f.Close()
+	defer os.Remove(dbPath)
+
+	store, err := storage.NewStore(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	m := metrics.NewMetrics(prometheus.NewRegistry())
+	disp := dispatcher.NewDispatcher(store, m, dispatcher.Config{
+		WorkerPoolSize:           2,
+		PollInterval:             50 * time.Millisecond,
+		BatchSize:                5,
+		AllowPrivateDestinations: true,
+	})
+	disp.Start()
+	// 1. Idempotent Dispatcher.Stop() must never panic on multiple calls
+	disp.Stop()
+	disp.Stop()
+
+	srv := api.NewServerWithOptions(store, disp, m, nil, api.ServerOptions{
+		AdminAPIKey:              "admin_key_v1",
+		AllowedOrigins:           "https://app1.example.com, https://app2.example.com",
+		AllowPrivateDestinations: false,
+	})
+
+	// 2. Multi-origin CORS matching + Vary: Origin, and public /metrics
+	reqMetrics := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	reqMetrics.Header.Set("Origin", "https://app2.example.com")
+	recMetrics := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(recMetrics, reqMetrics)
+	if recMetrics.Code != http.StatusOK || recMetrics.Header().Get("Access-Control-Allow-Origin") != "https://app2.example.com" || recMetrics.Header().Get("Vary") != "Origin" {
+		t.Fatalf("unexpected /metrics CORS response: code=%d origin=%q vary=%q", recMetrics.Code, recMetrics.Header().Get("Access-Control-Allow-Origin"), recMetrics.Header().Get("Vary"))
+	}
+
+	// Strict Bearer prefix required
+	badAuth := httptest.NewRequest(http.MethodGet, "/v1/tenants", nil)
+	badAuth.Header.Set("Authorization", "admin_key_v1")
+	badAuthRec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(badAuthRec, badAuth)
+	if badAuthRec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 when Bearer scheme is omitted, got %d", badAuthRec.Code)
+	}
+
+	ctx := context.Background()
+	_ = store.CreateTenant(ctx, &model.Tenant{ID: "t_alpha", Name: "Alpha"})
+	_ = store.CreateTenant(ctx, &model.Tenant{ID: "t_beta", Name: "Beta"})
+
+	// 3. SSRF blocking on loopback, private IPs, and cloud metadata
+	for _, target := range []string{
+		"http://127.0.0.1:8080/hook",
+		"http://169.254.169.254/latest/meta-data",
+		"http://10.0.0.1/internal",
+		"http://localhost/admin",
+	} {
+		req := httptest.NewRequest(http.MethodPost, "/v1/tenants/t_alpha/endpoints", bytes.NewBufferString(fmt.Sprintf(`{"url":%q}`, target)))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("X-API-Key", "admin_key_v1")
+		rec := httptest.NewRecorder()
+		srv.Handler().ServeHTTP(rec, req)
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("expected SSRF block 400 for %s, got %d", target, rec.Code)
+		}
+	}
+
+	// 4. 1 MiB Body cap (413), JSON null rejection (400), nonexistent tenant (404), limit/offset bounds
+	huge := strings.Repeat("a", (1<<20)+128)
+	hugeReq := httptest.NewRequest(http.MethodPost, "/v1/tenants/t_alpha/events", bytes.NewBufferString(fmt.Sprintf(`{"event_type":"x","payload":{"d":%q}}`, huge)))
+	hugeReq.Header.Set("Content-Type", "application/json")
+	hugeReq.Header.Set("X-API-Key", "admin_key_v1")
+	hugeRec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(hugeRec, hugeReq)
+	if hugeRec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("expected 413 on >1MiB event body, got %d", hugeRec.Code)
+	}
+
+	nullReq := httptest.NewRequest(http.MethodPost, "/v1/tenants/t_alpha/events", bytes.NewBufferString(`{"event_type":"x","payload":null}`))
+	nullReq.Header.Set("Content-Type", "application/json")
+	nullReq.Header.Set("X-API-Key", "admin_key_v1")
+	nullRec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(nullRec, nullReq)
+	if nullRec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 on null payload, got %d", nullRec.Code)
+	}
+
+	missReq := httptest.NewRequest(http.MethodPost, "/v1/tenants/t_missing/events", bytes.NewBufferString(`{"event_type":"x","payload":{"ok":true}}`))
+	missReq.Header.Set("Content-Type", "application/json")
+	missReq.Header.Set("X-API-Key", "admin_key_v1")
+	missRec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(missRec, missReq)
+	if missRec.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 on unknown tenant, got %d", missRec.Code)
+	}
+
+	// 5. Concurrent Idempotency-Key HTTP ingestion (only 1 new, others hydrate cleanly as 200 duplicate)
+	var status202, status200 atomic.Int32
+	var wg sync.WaitGroup
+	for i := 0; i < 6; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			r := httptest.NewRequest(http.MethodPost, "/v1/tenants/t_alpha/events", bytes.NewBufferString(`{"event_type":"order.paid","payload":{"amount":42}}`))
+			r.Header.Set("Content-Type", "application/json")
+			r.Header.Set("X-API-Key", "admin_key_v1")
+			r.Header.Set("Idempotency-Key", "idem-concurrent-key")
+			rec := httptest.NewRecorder()
+			srv.Handler().ServeHTTP(rec, r)
+			if rec.Code == http.StatusAccepted {
+				status202.Add(1)
+			} else if rec.Code == http.StatusOK {
+				var out struct {
+					Event model.Event `json:"event"`
+				}
+				_ = json.Unmarshal(rec.Body.Bytes(), &out)
+				if out.Event.EventType == "order.paid" {
+					status200.Add(1)
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	if status202.Load() != 1 || status200.Load() != 5 {
+		t.Fatalf("expected 1x202 and 5x200 hydrated duplicate, got 202=%d 200=%d", status202.Load(), status200.Load())
+	}
+
+	// 6. Concurrent FetchDueDeliveries locking, replay-all, and tenant-scoped AvgLatencyMs
+	if err := store.CreateEndpoint(ctx, &model.Endpoint{ID: "ep_a", TenantID: "t_alpha", URL: "https://example.com/a", SecretKey: "s1", EventTypes: []string{"*"}, IsActive: true, MaxRetries: 3, TimeoutSeconds: 5}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.CreateEvent(ctx, &model.Event{ID: "evt_a1", TenantID: "t_alpha", EventType: "order.created", Payload: []byte(`{"id":1}`)}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CreateDelivery(ctx, &model.Delivery{ID: "del_a1", TenantID: "t_alpha", EventID: "evt_a1", EndpointID: "ep_a", EndpointURL: "https://example.com/a", Status: model.StatusPending, MaxAttempts: 3}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CreateDelivery(ctx, &model.Delivery{ID: "del_a2", TenantID: "t_alpha", EventID: "evt_a1", EndpointID: "ep_a", EndpointURL: "https://example.com/a", Status: model.StatusDeadLetter, MaxAttempts: 3}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RecordAttempt(ctx, &model.Attempt{ID: "att_a1", DeliveryID: "del_a1", AttemptNumber: 1, ResponseStatus: 200, LatencyMs: 120}); err != nil {
+		t.Fatal(err)
+	}
+
+	var claimedTotal atomic.Int32
+	var fwg sync.WaitGroup
+	for g := 0; g < 4; g++ {
+		fwg.Add(1)
+		go func() {
+			defer fwg.Done()
+			list, _ := store.FetchDueDeliveries(ctx, 10)
+			claimedTotal.Add(int32(len(list)))
+		}()
+	}
+	fwg.Wait()
+	if claimedTotal.Load() != 1 {
+		t.Fatalf("expected exactly 1 exclusive pending claim across concurrent pollers, got %d", claimedTotal.Load())
+	}
+
+	// Replay-all DLQ resets del_a2 -> pending
+	repReq := httptest.NewRequest(http.MethodPost, "/v1/endpoints/ep_a/replay-all", nil)
+	repReq.Header.Set("X-API-Key", "admin_key_v1")
+	repRec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(repRec, repReq)
+	if repRec.Code != http.StatusOK {
+		t.Fatalf("expected 200 on replay-all, got %d", repRec.Code)
+	}
+	reloaded, _ := store.GetDelivery(ctx, "del_a2")
+	if reloaded == nil || reloaded.Status != model.StatusPending {
+		t.Fatalf("expected del_a2 to reset to pending after replay-all, got %+v", reloaded)
+	}
+
+	// Stats tenant isolation: Beta has 0 attempts so AvgLatencyMs must be 0, while Alpha is 120
+	alphaStats, _ := store.GetStats(ctx, "t_alpha")
+	betaStats, _ := store.GetStats(ctx, "t_beta")
+	if alphaStats.AvgLatencyMs != 120 || betaStats.AvgLatencyMs != 0 {
+		t.Fatalf("tenant stats AvgLatencyMs isolation failed: alpha=%v beta=%v", alphaStats.AvgLatencyMs, betaStats.AvgLatencyMs)
+	}
+}
+
